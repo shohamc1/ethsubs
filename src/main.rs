@@ -10,10 +10,16 @@ use jsonrpsee::{
 };
 use serde_json::Value;
 use std::net::SocketAddr;
+use jsonrpsee::types::ErrorObjectOwned;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
 const NUM_SUBSCRIPTION_RESPONSES: usize = 5;
+
+struct Client {
+    socket: BroadcastStream<Value>,
+    arg: i32
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,8 +33,8 @@ async fn main() -> anyhow::Result<()> {
 
     let client1 = WsClientBuilder::default().build(&url).await?;
     let client2 = WsClientBuilder::default().build(&url).await?;
-    let sub1: Subscription<Value> = client1.subscribe("subscribe_hello", rpc_params![], "unsubscribe_hello").await?;
-    let sub2: Subscription<Value> = client2.subscribe("subscribe_hello", rpc_params![], "unsubscribe_hello").await?;
+    let sub1: Subscription<Value> = client1.subscribe("subscribe_hello", rpc_params![0], "unsubscribe_hello").await?;
+    let sub2: Subscription<Value> = client2.subscribe("subscribe_hello", rpc_params![1], "unsubscribe_hello").await?;
 
     let fut1 = sub1.take(NUM_SUBSCRIPTION_RESPONSES).for_each(|r| async move { tracing::info!("sub1 rx: {:?}", r) });
     let fut2 = sub2.take(NUM_SUBSCRIPTION_RESPONSES).for_each(|r| async move { tracing::info!("sub2 rx: {:?}", r) });
@@ -48,10 +54,19 @@ async fn run_server() -> anyhow::Result<SocketAddr> {
     std::thread::spawn(move || produce_items(tx));
 
     module
-        .register_subscription("subscribe_hello", "s_hello", "unsubscribe_hello", |_, pending, tx| async move {
+        .register_subscription("subscribe_hello", "s_hello", "unsubscribe_hello", |params, pending, tx| async move {
+            let param = match params.one::<i32>() {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = pending.reject(ErrorObjectOwned::from(e)).await;
+                    return Ok(());
+                }
+            };
+
             let rx = tx.subscribe();
             let stream = BroadcastStream::new(rx);
-            pipe_from_stream_with_bounded_buffer(pending, stream).await?;
+            let client = Client{ socket: stream, arg: param };
+            pipe_from_stream_with_bounded_buffer(pending, client).await?;
             Ok(())
         })
         .unwrap();
@@ -67,7 +82,7 @@ async fn run_server() -> anyhow::Result<SocketAddr> {
 
 async fn pipe_from_stream_with_bounded_buffer(
     pending: PendingSubscriptionSink,
-    stream: BroadcastStream<Value>,
+    stream: Client,
 ) -> Result<(), anyhow::Error> {
     let sink = pending.accept().await?;
     let closed = sink.closed();
@@ -75,7 +90,7 @@ async fn pipe_from_stream_with_bounded_buffer(
     futures::pin_mut!(closed, stream);
 
     loop {
-        match future::select(closed, stream.next()).await {
+        match future::select(closed, stream.socket.next()).await {
             // subscription closed.
             Either::Left((_, _)) => break Ok(()),
 
@@ -86,8 +101,10 @@ async fn pipe_from_stream_with_bounded_buffer(
                 // NOTE: this will block until there a spot in the queue
                 // and you might want to do something smarter if it's
                 // critical that "the most recent item" must be sent when it is produced.
-                if sink.send(notif).await.is_err() {
-                    break Ok(());
+                if stream.arg == 0 {
+                    if sink.send(notif).await.is_err() {
+                        break Ok(());
+                    }
                 }
 
                 closed = c;
