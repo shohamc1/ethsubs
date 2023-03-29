@@ -41,7 +41,6 @@ async fn main() {
     tokio::spawn(handle.stopped());
 
     let url = format!("ws://{}", addr);
-
     let client = WsClientBuilder::default().build(&url).await.unwrap();
 
     let mut ping_sub: Subscription<Value> = client
@@ -49,7 +48,7 @@ async fn main() {
         .await
         .unwrap();
 
-    std::thread::spawn(move || send_items(tx));
+    tokio::spawn(send_items(tx));
 
     for _ in 0..10 {
         let ping = ping_sub.next().await.unwrap().unwrap();
@@ -67,33 +66,36 @@ pub async fn pipe_from_stream_and_drop(
         tokio::select! {
 			_ = sink.closed() => return Err(anyhow::anyhow!("Subscription was closed")),
 			maybe_item = stream.next() => {
-				let item = match maybe_item {
-					Some(item) => item,
+				match maybe_item {
+                    Some(Err(e)) => {
+                        println!("e : {:#?}", e);
+                    },
 					None => return Err(anyhow::anyhow!("Subscription executed successful")),
-				};
-				let msg = SubscriptionMessage::from_json(&item.unwrap())?;
+					Some(item) => {
+                    let msg = SubscriptionMessage::from_json(&item.unwrap())?;
 
-				match sink.try_send(msg) {
-					Ok(_) => (),
-					Err(TrySendError::Closed(_)) => return Err(anyhow::anyhow!("Subscription executed successful")),
-					// channel is full, let's be naive an just drop the message.
-					Err(TrySendError::Full(_)) => (),
-				}
-			}
-		}
+                    match sink.try_send(msg) {
+                        Ok(_) => (),
+                        Err(TrySendError::Closed(_)) => return Err(anyhow::anyhow!("Subscription executed successful")),
+                        // channel is full, let's be naive an just drop the message.
+                        Err(TrySendError::Full(_)) => (),
+                    }
+                }
+                }
+            }
+        }
     }
 }
 
 async fn send_items(tx: broadcast::Sender<Value>) {
     let data = r#"
         {
-            "hello": "there",
+            "hello": "there"
         }"#;
 
     for c in 1..=100 {
-        std::thread::sleep(std::time::Duration::from_millis(10000));
         let v = serde_json::from_str(data).unwrap();
         let _ = tx.send(v);
-        println!("Sent data");
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
